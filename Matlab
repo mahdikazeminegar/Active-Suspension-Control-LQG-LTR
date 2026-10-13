@@ -1,0 +1,358 @@
+clear; clc; close all;
+
+%% ----------------- Physical Parameters -----------------
+ms  = 600;     % sprung mass (kg)
+Iy  = 900;     % pitch inertia (kg.m^2)
+muf = 45;      % front unsprung mass (kg)
+mur = 45;      % rear  unsprung mass (kg)
+
+ksf = 30000;   % front suspension stiffness (N/m)
+ksr = 30000;   % rear  suspension stiffness (N/m)
+ktf = 200000;  % front tire stiffness (N/m)
+ktr = 200000;  % rear  tire stiffness (N/m)
+
+csf = 1500;    % front suspension damping (N.s/m)
+csr = 1500;    % rear  suspension damping (N.s/m)
+
+lf = 1.2;      % distance CG to front axle (m)
+lr = 1.6;      % distance CG to rear axle  (m)
+
+%% ----------------- State-Space Model -----------------
+% States: x = [ zc; theta; zuf; zur; zc_dot; theta_dot; zuf_dot; zur_dot ]
+% Inputs: u = [ uf; ur ]
+% Disturbances: w = [ wf; wr ]
+
+A = [ ...
+    0  0  0  0  1  0  0  0;
+    0  0  0  0  0  1  0  0;
+    0  0  0  0  0  0  1  0;
+    0  0  0  0  0  0  0  1;
+   -(ksf+ksr)/ms,        (ksf*lf-ksr*lr)/ms,       ksf/ms,            ksr/ms, ...
+   -(csf+csr)/ms,        (csf*lf-csr*lr)/ms,       csf/ms,            csr/ms;
+    (lf*ksf-lr*ksr)/Iy, -(lf^2*ksf+lr^2*ksr)/Iy,  -lf*ksf/Iy,        lr*ksr/Iy, ...
+    (lf*csf-lr*csr)/Iy, -(lf^2*csf+lr^2*csr)/Iy,  -lf*csf/Iy,        lr*csr/Iy;
+    ksf/muf,            -lf*ksf/muf,             -(ksf+ktf)/muf,    0, ...
+    csf/muf,            -lf*csf/muf,             -csf/muf,          0;
+    ksr/mur,             lr*ksr/mur,              0,               -(ksr+ktr)/mur, ...
+    csr/mur,             lr*csr/mur,              0,               -csr/mur];
+
+B = [ ...
+    0      0;
+    0      0;
+    0      0;
+    0      0;
+    1/ms   1/ms;
+   -lf/Iy  lr/Iy;
+   -1/muf  0;
+    0     -1/mur];
+
+G = [ ...
+    0       0;
+    0       0;
+    0       0;
+    0       0;
+    0       0;
+    0       0;
+    ktf/muf 0;
+    0       ktr/mur];
+
+%% ----------------- Output Matrix for Observer -----------------
+% Measured states: zc, theta, zuf, zur, zc_dot, theta_dot
+C = [ ...
+    1 0 0 0 0 0 0 0;   % zc
+    0 1 0 0 0 0 0 0;   % theta
+    0 0 1 0 0 0 0 0;   % zuf
+    0 0 0 1 0 0 0 0;   % zur
+    0 0 0 0 1 0 0 0;   % zc_dot
+    0 0 0 0 0 1 0 0];  % theta_dot
+
+%% ----------------- LQR Design -----------------
+Q = diag([ ...
+    5e5 ...   % zc
+    8e5 ...   % theta
+    1e4 ...   % zuf
+    1e4 ...   % zur
+    8e4 ...   % zc_dot
+    2e5 ...   % theta_dot
+    5e3 ...   % zuf_dot
+    5e3 ]);   % zur_dot
+
+R = diag([1e-2 1e-2]);
+
+[K,~,~] = lqr(A,B,Q,R);
+
+%% ----------------- Kalman Filter (LQE) Design -----------------
+Gamma = eye(8);
+
+W = diag([ ...
+    1e-4 1e-4 1e-4 1e-4 ...
+    1e-2 1e-2 1e-2 1e-2 ]);  % process noise covariance
+
+V = diag([1e-6 1e-6 1e-6 1e-6 1e-5 1e-5]);  % measurement noise covariance
+
+[L,~,~] = lqe(A,Gamma,C,W,V);
+
+%% ----------------- LTR Design -----------------
+q_ltr = 1e3;                        % LTR tuning parameter
+Wq    = q_ltr * (B*B') + 1e-6*eye(8);
+[L_ltr,~,~] = lqe(A,eye(8),C,Wq,V);
+
+%% ----------------- Simulation Settings -----------------
+tEnd = 5;
+dt   = 1e-3;
+t    = (0:dt:tEnd)';
+
+%% ----------------- Road Bump Profile -----------------
+% Half-sine bump on front wheel, rear wheel delayed by tau
+h  = 0.05;   % bump height [m]
+Tb = 0.20;   % bump duration [s]
+t0 = 0.50;   % bump start [s]
+
+Vcar = 10;         % car speed [m/s]
+Lwb  = lf + lr;    % wheelbase [m]
+tau  = Lwb / Vcar; % delay between front and rear
+
+wf = zeros(size(t));
+wr = zeros(size(t));
+
+idx_f = (t >= t0) & (t <= t0 + Tb);
+wf(idx_f) = h * sin(pi * (t(idx_f) - t0) / Tb);
+
+idx_r = (t >= t0 + tau) & (t <= t0 + tau + Tb);
+wr(idx_r) = h * sin(pi * (t(idx_r) - (t0 + tau)) / Tb);
+
+w = [wf wr];   % size: length(t) x 2
+
+%% ----------------- Initial Conditions -----------------
+x0    = zeros(8,1);   % states
+xhat0 = zeros(8,1);   % observer states
+
+%% ----------------- Simulate Passive System -----------------
+[tp, xp] = ode45(@(tt,xx) passive_dynamics(tt, xx, t, w, A, G), t, x0);
+
+%% ----------------- Simulate LQG -----------------
+x0_lqg = [x0; xhat0]; % augmented state (x; xhat)
+[tlqg, xlqg] = ode45(@(tt,xx) lqg_dynamics(tt, xx, t, w, A, B, G, C, K, L), t, x0_lqg);
+
+%% ----------------- Simulate LQG/LTR -----------------
+x0_ltr = [x0; xhat0];
+[tltr, xltr] = ode45(@(tt,xx) lqg_dynamics(tt, xx, t, w, A, B, G, C, K, L_ltr), t, x0_ltr);
+
+%% ----------------- Post-Processing -----------------
+% Passive outputs
+u_passive = zeros(length(tp),2);
+outP = compute_outputs(tp, xp, t, w, A, B, G, lf, lr, u_passive);
+
+% LQG outputs
+x_lqg    = xlqg(:,1:8);
+xhat_lqg = xlqg(:,9:16);
+u_lqg    = -(K * xhat_lqg')';   % size: length(t) x 2
+outLQG   = compute_outputs(tlqg, x_lqg, t, w, A, B, G, lf, lr, u_lqg);
+
+% LTR outputs
+x_ltr    = xltr(:,1:8);
+xhat_ltr = xltr(:,9:16);
+u_ltr    = -(K * xhat_ltr')';
+outLTR   = compute_outputs(tltr, x_ltr, t, w, A, B, G, lf, lr, u_ltr);
+
+%% ----------------- Performance Metrics -----------------
+fprintf('\n===== Performance Metrics (RMS) =====\n');
+fprintf('Passive  : body acc = %.4f m/s^2, pitch acc = %.4f rad/s^2\n', ...
+    rms(outP.zc_ddot), rms(outP.theta_ddot));
+fprintf('LQG      : body acc = %.4f m/s^2, pitch acc = %.4f rad/s^2\n', ...
+    rms(outLQG.zc_ddot), rms(outLQG.theta_ddot));
+fprintf('LQG/LTR  : body acc = %.4f m/s^2, pitch acc = %.4f rad/s^2\n', ...
+    rms(outLTR.zc_ddot), rms(outLTR.theta_ddot));
+
+fprintf('\n===== Max Suspension Deflection =====\n');
+fprintf('Passive  : front = %.4f m, rear = %.4f m\n', ...
+    max(abs(outP.dzf)), max(abs(outP.dzr)));
+fprintf('LQG      : front = %.4f m, rear = %.4f m\n', ...
+    max(abs(outLQG.dzf)), max(abs(outLQG.dzr)));
+fprintf('LQG/LTR  : front = %.4f m, rear = %.4f m\n', ...
+    max(abs(outLTR.dzf)), max(abs(outLTR.dzr)));
+
+fprintf('\n===== Max Control Force =====\n');
+fprintf('LQG      : uf = %.2f N, ur = %.2f N\n', ...
+    max(abs(outLQG.uf)), max(abs(outLQG.ur)));
+fprintf('LQG/LTR  : uf = %.2f N, ur = %.2f N\n', ...
+    max(abs(outLTR.uf)), max(abs(outLTR.ur)));
+
+%% ----------------- Plots -----------------
+% Road input
+figure('Name','Road Input','Color','w');
+plot(t, wf, 'b', 'LineWidth', 1.5); hold on;
+plot(t, wr, 'r--', 'LineWidth', 1.5);
+grid on;
+xlabel('Time (s)');
+ylabel('Road displacement (m)');
+legend('w_f','w_r');
+title('Bump Input');
+
+% Body vertical displacement
+figure('Name','Body Heave','Color','w');
+plot(tp, outP.zc, 'k', 'LineWidth', 1.4); hold on;
+plot(tlqg, outLQG.zc, 'b', 'LineWidth', 1.4);
+plot(tltr, outLTR.zc, 'r', 'LineWidth', 1.4);
+grid on;
+xlabel('Time (s)');
+ylabel('z_c (m)');
+legend('Passive','LQG','LQG/LTR');
+title('Body Vertical Displacement');
+
+% Pitch angle
+figure('Name','Pitch Angle','Color','w');
+plot(tp, outP.theta, 'k', 'LineWidth', 1.4); hold on;
+plot(tlqg, outLQG.theta, 'b', 'LineWidth', 1.4);
+plot(tltr, outLTR.theta, 'r', 'LineWidth', 1.4);
+grid on;
+xlabel('Time (s)');
+ylabel('\theta (rad)');
+legend('Passive','LQG','LQG/LTR');
+title('Pitch Angle');
+
+% Body acceleration
+figure('Name','Body Acceleration','Color','w');
+plot(tp, outP.zc_ddot, 'k', 'LineWidth', 1.4); hold on;
+plot(tlqg, outLQG.zc_ddot, 'b', 'LineWidth', 1.4);
+plot(tltr, outLTR.zc_ddot, 'r', 'LineWidth', 1.4);
+grid on;
+xlabel('Time (s)');
+ylabel('\ddot{z}_c (m/s^2)');
+legend('Passive','LQG','LQG/LTR');
+title('Body Vertical Acceleration');
+
+% Pitch acceleration
+figure('Name','Pitch Acceleration','Color','w');
+plot(tp, outP.theta_ddot, 'k', 'LineWidth', 1.4); hold on;
+plot(tlqg, outLQG.theta_ddot, 'b', 'LineWidth', 1.4);
+plot(tltr, outLTR.theta_ddot, 'r', 'LineWidth', 1.4);
+grid on;
+xlabel('Time (s)');
+ylabel('\ddot{\theta} (rad/s^2)');
+legend('Passive','LQG','LQG/LTR');
+title('Pitch Angular Acceleration');
+
+% Front suspension deflection
+figure('Name','Front Suspension Deflection','Color','w');
+plot(tp, outP.dzf, 'k', 'LineWidth', 1.4); hold on;
+plot(tlqg, outLQG.dzf, 'b', 'LineWidth', 1.4);
+plot(tltr, outLTR.dzf, 'r', 'LineWidth', 1.4);
+grid on;
+xlabel('Time (s)');
+ylabel('\Delta z_f (m)');
+legend('Passive','LQG','LQG/LTR');
+title('Front Suspension Deflection');
+
+% Rear suspension deflection
+figure('Name','Rear Suspension Deflection','Color','w');
+plot(tp, outP.dzr, 'k', 'LineWidth', 1.4); hold on;
+plot(tlqg, outLQG.dzr, 'b', 'LineWidth', 1.4);
+plot(tltr, outLTR.dzr, 'r', 'LineWidth', 1.4);
+grid on;
+xlabel('Time (s)');
+ylabel('\Delta z_r (m)');
+legend('Passive','LQG','LQG/LTR');
+title('Rear Suspension Deflection');
+
+% Control forces
+figure('Name','Control Forces','Color','w');
+subplot(2,1,1);
+plot(tlqg, outLQG.uf, 'b', 'LineWidth', 1.4); hold on;
+plot(tltr, outLTR.uf, 'r', 'LineWidth', 1.4);
+grid on;
+xlabel('Time (s)');
+ylabel('u_f (N)');
+legend('LQG','LQG/LTR');
+title('Front Actuator Force');
+
+subplot(2,1,2);
+plot(tlqg, outLQG.ur, 'b', 'LineWidth', 1.4); hold on;
+plot(tltr, outLTR.ur, 'r', 'LineWidth', 1.4);
+grid on;
+xlabel('Time (s)');
+ylabel('u_r (N)');
+legend('LQG','LQG/LTR');
+title('Rear Actuator Force');
+
+% Unsprung masses
+figure('Name','Unsprung Masses','Color','w');
+subplot(2,1,1);
+plot(tp, outP.zuf, 'k', 'LineWidth', 1.4); hold on;
+plot(tlqg, outLQG.zuf, 'b', 'LineWidth', 1.4);
+plot(tltr, outLTR.zuf, 'r', 'LineWidth', 1.4);
+grid on;
+xlabel('Time (s)');
+ylabel('z_{uf} (m)');
+legend('Passive','LQG','LQG/LTR');
+title('Front Unsprung Mass');
+
+subplot(2,1,2);
+plot(tp, outP.zur, 'k', 'LineWidth', 1.4); hold on;
+plot(tlqg, outLQG.zur, 'b', 'LineWidth', 1.4);
+plot(tltr, outLTR.zur, 'r', 'LineWidth', 1.4);
+grid on;
+xlabel('Time (s)');
+ylabel('z_{ur} (m)');
+legend('Passive','LQG','LQG/LTR');
+title('Rear Unsprung Mass');
+
+%% ----------------- Local Functions -----------------
+function dx = passive_dynamics(tt, x, tgrid, wgrid, A, G)
+    % interpolate road disturbance (row 1x2) then make column 2x1
+    w = interp1(tgrid, wgrid, tt, 'linear', 'extrap');
+    w = w(:);   % 2x1
+    dx = A*x + G*w;
+end
+
+function dx = lqg_dynamics(tt, xaug, tgrid, wgrid, A, B, G, C, K, L)
+    x    = xaug(1:8);
+    xhat = xaug(9:16);
+
+    w = interp1(tgrid, wgrid, tt, 'linear', 'extrap');
+    w = w(:);   % 2x1
+
+    u = -K*xhat;
+    y = C*x;
+
+    xdot    = A*x    + B*u + G*w;
+    xhatdot = A*xhat + B*u + L*(y - C*xhat);
+
+    dx = [xdot; xhatdot];
+end
+
+function out = compute_outputs(tsim, xsim, tgrid, wgrid, A, B, G, lf, lr, usim)
+    n = length(tsim);
+
+    zc    = xsim(:,1);
+    theta = xsim(:,2);
+    zuf   = xsim(:,3);
+    zur   = xsim(:,4);
+
+    dzf = zc - lf*theta - zuf;
+    dzr = zc + lr*theta - zur;
+
+    zc_ddot    = zeros(n,1);
+    theta_ddot = zeros(n,1);
+
+    for i = 1:n
+        w = interp1(tgrid, wgrid, tsim(i), 'linear', 'extrap');
+        w = w(:);  % 2x1
+        x = xsim(i,:)';
+        u = usim(i,:)';
+        xdot = A*x + B*u + G*w;
+        zc_ddot(i)    = xdot(5);
+        theta_ddot(i) = xdot(6);
+    end
+
+    out.zc         = zc;
+    out.theta      = theta;
+    out.zuf        = zuf;
+    out.zur        = zur;
+    out.dzf        = dzf;
+    out.dzr        = dzr;
+    out.zc_ddot    = zc_ddot;
+    out.theta_ddot = theta_ddot;
+    out.uf         = usim(:,1);
+    out.ur         = usim(:,2);
+end
